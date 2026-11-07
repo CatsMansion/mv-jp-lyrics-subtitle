@@ -1,0 +1,144 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""Regenerate SRT / word-level LRC / verification report from a lines_final.json.
+
+Standalone: no project-specific paths, no third-party deps beyond stdlib.
+Usage:
+  python build_subtitles.py --source data/lines_final.json \
+                            --timeline data/timeline_ja.md --out .
+
+--timeline is optional; when given, every row is cross-checked against it.
+"""
+import argparse, json, os, re, sys
+
+
+def srt_ts(x):
+    h = int(x // 3600); m = int((x % 3600) // 60); s = x % 60
+    ms = round((s - int(s)) * 1000)
+    if ms >= 1000:            # guard against float rounding at x.9996
+        s += 1; ms = 0
+    return f'{h:02d}:{m:02d}:{int(s):02d},{ms:03d}'
+
+
+def lrc_ts(x):
+    return f'{int(x // 60):02d}:{x % 60:05.2f}'
+
+
+def verify(rows, dur, tol=0.011):
+    """Ask 'is it out of bounds', not 'is it perfect'. Zero-length tokens are
+    data defects in the aligner output, not boundary violations."""
+    issues, zero_len, boundary, overlap, gaps, overrides = [], [], [], [], [], []
+    if len(rows) != 22:
+        issues.append(f'row count {len(rows)} != 22')
+    prev_e = -1
+    total_toks = 0; span = 0.0
+    for r in rows:
+        i, s, e = r['i'], r['s'], r['e']
+        if not (s < e): issues.append(f'row {i}: s>=e')
+        if s < prev_e - 1e-6: issues.append(f'row {i}: overlaps previous row')
+        if e > dur: issues.append(f'row {i}: exceeds duration')
+        prev_e = e
+        for p in r.get('phrases', []):
+            if p['s'] < s - tol or p['e'] > e + tol or p['s'] >= p['e']:
+                issues.append(f'row {i} phrase out of bounds')
+            if p.get('ovr'): overrides.append((i, p['text'], p['ovr']))
+        tk = r.get('toks', [])
+        total_toks += len(tk)
+        for j, t in enumerate(tk):
+            if t['e'] - t['s'] <= 1e-6: zero_len.append((i, t['t'], t['s']))
+            if t['s'] < s - tol or t['e'] > e + tol:
+                boundary.append((i, t['t']))
+                issues.append(f'row {i} token {t["t"]} out of bounds')
+            if j and t['s'] < tk[j-1]['e'] - tol:
+                overlap.append((i, t['t']))
+                issues.append(f'row {i} token {t["t"]} overlaps previous')
+            if j and t['s'] > tk[j-1]['e'] + 1e-6:
+                gaps.append((i, tk[j-1]['e'], t['s']))
+        if tk: span += sum(t['e'] - t['s'] for t in tk)
+    return dict(rows=len(rows), dur=dur, tokens=total_toks, span=span,
+                overrides=overrides, zero_len=zero_len, boundary=boundary,
+                overlap=overlap, gaps=gaps, issues=issues)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--source', required=True, help='path to lines_final.json')
+    ap.add_argument('--timeline', default=None, help='optional markdown timeline to cross-check')
+    ap.add_argument('--out', default='.', help='output directory')
+    a = ap.parse_args()
+
+    with open(a.source, encoding='utf-8') as f:
+        d = json.load(f)
+    rows, dur = d['rows'], d['dur']
+    v = verify(rows, dur)
+
+    print(f'rows={v["rows"]} dur={dur}s tokens={v["tokens"]} span={v["span"]:.2f}s')
+    print(f'overrides={len(v["overrides"])} gaps={len(v["gaps"])} '
+          f'zero_len={len(v["zero_len"])} boundary={len(v["boundary"])} '
+          f'overlap={len(v["overlap"])} issues={len(v["issues"])}')
+
+    md_diff = []
+    if a.timeline:
+        md = {}
+        for line in open(a.timeline, encoding='utf-8'):
+            m = re.match(r'\|\s*(\d+)\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)\s*\|\s*(.*?)\s*\|', line)
+            if m: md[int(m.group(1))] = (float(m.group(2)), float(m.group(3)), m.group(4))
+        for r in rows:
+            i = r['i']
+            if i not in md:
+                md_diff.append(f'row {i}: missing in timeline')
+            elif (abs(md[i][0]-r['s']) > 1e-6 or abs(md[i][1]-r['e']) > 1e-6
+                  or md[i][2].strip() != r['text'].strip()):
+                md_diff.append(f'row {i}: mismatch')
+        print(f'timeline cross-check: {len(md_diff)} mismatch(es)')
+
+    os.makedirs(a.out, exist_ok=True)
+
+    # SRT (line level)
+    srt = []
+    for r in rows:
+        srt += [str(r['i']), f"{srt_ts(r['s'])} --> {srt_ts(r['e'])}", r['text'], '']
+    with open(os.path.join(a.out, 'lyrics_v22.srt'), 'w', encoding='utf-8-sig') as f:
+        f.write('\n'.join(srt))
+
+    # Enhanced LRC (A2 word-level tags)
+    lrc = ['[ti:ピアス]', '[ar:]', f'[length:{int(dur//60):02d}:{dur%60:05.2f}]',
+           '[re:v22 forced-alignment + envelope]', '']
+    for r in rows:
+        tk = r.get('toks', [])
+        inner = ''.join(f"<{lrc_ts(t['s'])}>{t['t']}" for t in tk) if tk else r['text']
+        lrc.append(f"[{lrc_ts(r['s'])}]{inner}")
+    with open(os.path.join(a.out, 'lyrics_v22_wordlevel.lrc'), 'w', encoding='utf-8-sig') as f:
+        f.write('\n'.join(lrc) + '\n')
+
+    # Verification report
+    L = ['# Timing verification', '',
+         'Regenerated by `tools/build_subtitles.py`. All numbers are measured, not transcribed.', '',
+         '| item | value |', '|---|---|',
+         f'| rows | {v["rows"]} |', f'| duration | {dur}s |',
+         f'| word/mora tokens | {v["tokens"]} |',
+         f'| token coverage | {v["span"]:.2f}s |',
+         f'| phrase overrides | {len(v["overrides"])} |',
+         f'| inter-word silence gaps | {len(v["gaps"])} |',
+         f'| zero-length tokens | {len(v["zero_len"])} |',
+         f'| boundary violations (>10ms) | {len(v["boundary"])} |',
+         f'| overlapping tokens | {len(v["overlap"])} |',
+         f'| timeline mismatches | {len(md_diff)} |',
+         f'| structural issues | {len(v["issues"])} |', '',
+         '## Zero-length tokens (do not allocate visible duration)', '']
+    for i, t, s in v['zero_len']:
+        L.append(f'- row {i} `{t}` @{s:.3f}')
+    L += ['', '## Phrase overrides (why uniform syllable splitting fails)', '']
+    for i, txt, why in v['overrides']:
+        L.append(f'- **row {i}** `{txt}`: {why}')
+    if v['issues']:
+        L += ['', '## Structural issues', ''] + [f'- {x}' for x in v['issues']]
+    with open(os.path.join(a.out, 'VERIFICATION.md'), 'w', encoding='utf-8') as f:
+        f.write('\n'.join(L) + '\n')
+
+    print(f'wrote lyrics_v22.srt / lyrics_v22_wordlevel.lrc / VERIFICATION.md to {a.out}')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
